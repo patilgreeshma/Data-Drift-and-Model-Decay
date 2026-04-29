@@ -31,6 +31,7 @@ def calculate_psi(expected, actual, bins=10):
 
 def detect_drift_psi(baseline_df, new_df):
     results = []
+    # Both should be numeric at this point
     numerical_cols = baseline_df.select_dtypes(include=[np.number]).columns
     for col in numerical_cols:
         if col in new_df.columns:
@@ -47,12 +48,17 @@ def detect_drift_psi(baseline_df, new_df):
 
 def run_monitoring(model_path='model.pkl', scaler_path='scaler.pkl', 
                    imputer_path='imputer.pkl', baseline_path='baseline.pkl', 
-                   new_data_path='new_data.csv', target_col='default.payment.next.month'):
+                   encoders_path='encoders.pkl',
+                   new_data_path='new_data.csv', target_col='income'):
     logging.info("Loading artifacts...")
     model = joblib.load(model_path)
     scaler = joblib.load(scaler_path)
     imputer = joblib.load(imputer_path)
     baseline = joblib.load(baseline_path)
+    
+    encoders = {}
+    if os.path.exists(encoders_path):
+        encoders = joblib.load(encoders_path)
     
     baseline_df = baseline['X_train']
     baseline_f1 = baseline['baseline_f1']
@@ -60,9 +66,24 @@ def run_monitoring(model_path='model.pkl', scaler_path='scaler.pkl',
     
     logging.info(f"Loading new data from {new_data_path}")
     new_df = pd.read_csv(new_data_path)
+    
+    # Replace '?' with NaN
+    new_df = new_df.replace('?', np.nan)
+    
     if 'ID' in new_df.columns:
         new_df = new_df.drop(columns=['ID'])
         
+    # Apply Encoding
+    logging.info("Encoding categorical columns...")
+    for col, le in encoders.items():
+        if col == 'target':
+            if target_col in new_df.columns:
+                # Use a small trick to handle unseen labels if any, but LabelEncoder is strict
+                # For monitoring, we might just use the same transformation
+                new_df[target_col] = new_df[target_col].astype(str).map(lambda x: le.transform([x])[0] if x in le.classes_ else -1)
+        elif col in new_df.columns:
+            new_df[col] = new_df[col].astype(str).map(lambda x: le.transform([x])[0] if x in le.classes_ else -1)
+
     y_true = None
     if target_col in new_df.columns:
         y_true = new_df[target_col]
@@ -126,7 +147,6 @@ def run_monitoring(model_path='model.pkl', scaler_path='scaler.pkl',
     logging.info(f"Trend Analysis    : {trend_status}")
     logging.info(f"Alert Triggered   : {'Yes' if alert_triggered else 'No'}")
     
-    # Output to stdout or save to csv if needed, but returning dict is good
     return {
         'drift_score': drift_score,
         'drift_report': drift_report,

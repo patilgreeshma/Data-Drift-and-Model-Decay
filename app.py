@@ -56,8 +56,6 @@ def get_unified_drift(expected, actual):
     kl = calculate_kl_divergence(expected, actual)
     js = calculate_js_divergence(expected, actual)
     
-    # Normalizing weights for a unified score
-    # PSI is usually higher magnitude, JS/KL are 0-1 bounded (mostly)
     return (0.5 * psi) + (0.25 * kl) + (0.25 * js), psi, kl, js
 
 # -----------------------------------
@@ -88,7 +86,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ Adaptive ML Observability Framework")
+st.title(" Data Drift & Model Decay Monitoring System")
 st.caption("Multi-Metric Drift Detection | Dynamic Baseline | Automated Decay Analysis")
 
 # -----------------------------------
@@ -97,36 +95,46 @@ st.caption("Multi-Metric Drift Detection | Dynamic Baseline | Automated Decay An
 with st.sidebar:
     st.header("⚙️ Configuration")
     alpha = st.slider("Drift Influence (α)", 0.0, 1.0, 0.6, help="Weight given to drift vs performance in Impact Score")
-    threshold = st.number_input("Alert Threshold", value=0.1, step=0.01)
+    threshold = st.number_input("Alert Threshold", value=0.05, step=0.01)
     window_size = st.number_input("Rolling Window size", value=5, min_value=1)
-    target_col = st.text_input("Target Column Name", placeholder="e.g. default.payment.next.month")
+    target_col = st.text_input("Target Column Name", value="income")
     
     st.divider()
     st.header("📂 Upload Artifacts")
     model_file = st.file_uploader("Model (.pkl)", type=['pkl'])
     baseline_file = st.file_uploader("Initial Baseline (.pkl)", type=['pkl'])
+    scaler_file = st.file_uploader("Scaler (.pkl)", type=['pkl'])
+    imputer_file = st.file_uploader("Imputer (.pkl)", type=['pkl'])
+    encoders_file = st.file_uploader("Encoders (.pkl)", type=['pkl'])
     new_data_file = st.file_uploader("Incoming Data (.csv)", type=['csv'])
 
 if not (model_file and baseline_file and new_data_file):
-    st.info("👋 Welcome! Please upload your Model, Baseline, and New Data to begin monitoring.")
+    st.info("👋 Welcome! Please upload your artifacts (Model, Baseline, and New Data) to begin.")
     st.stop()
 
 # -----------------------------------
 # DATA PROCESSING
 # -----------------------------------
-@st.cache_resource
-def load_model_objects(_m, _b):
-    return joblib.load(_m), joblib.load(_b)
+def load_all_artifacts(_m, _b, _s, _i, _e):
+    return (
+        joblib.load(_m), 
+        joblib.load(_b), 
+        joblib.load(_s) if _s else None,
+        joblib.load(_i) if _i else None,
+        joblib.load(_e) if _e else {}
+    )
 
 try:
-    model, baseline_obj = load_model_objects(model_file, baseline_file)
+    model, baseline_obj, scaler, imputer, encoders = load_all_artifacts(
+        model_file, baseline_file, scaler_file, imputer_file, encoders_file
+    )
     baseline_df = baseline_obj['X_train']
-    base_perf = baseline_obj.get('baseline_f1', 0.8) # Default if missing
+    base_perf = baseline_obj.get('baseline_f1', 0.8)
 except Exception as e:
-    st.error(f"Error loading files: {e}")
+    st.error(f"Error loading artifacts: {e}")
     st.stop()
 
-# Check for dynamic baseline storage
+# Initialize session state
 if 'rolling_buffer' not in st.session_state:
     st.session_state.rolling_buffer = [baseline_df]
 if 'perf_history' not in st.session_state:
@@ -134,20 +142,33 @@ if 'perf_history' not in st.session_state:
 
 # Process incoming data
 new_df = pd.read_csv(new_data_file)
+new_df = new_df.replace('?', np.nan)
 
-# Dataset Agnostic Logic
-if target_col and target_col in new_df.columns:
+# Drop ID if exists
+if 'ID' in new_df.columns:
+    new_df = new_df.drop(columns=['ID'])
+
+# Apply Encoding to new data
+if isinstance(encoders, dict):
+    for col, le in encoders.items():
+        if col == 'target':
+            if target_col in new_df.columns:
+                new_df[target_col] = new_df[target_col].astype(str).map(lambda x: le.transform([x])[0] if x in le.classes_ else -1)
+        elif col in new_df.columns:
+            new_df[col] = new_df[col].astype(str).map(lambda x: le.transform([x])[0] if x in le.classes_ else -1)
+else:
+    st.warning("Encoders artifact is not a valid dictionary. Skipping encoding.")
+
+# Split features and target
+if target_col in new_df.columns:
     y_true = new_df[target_col]
     X_new = new_df.drop(columns=[target_col])
-    if 'ID' in X_new.columns: X_new = X_new.drop(columns=['ID']) # Common junk column
 else:
     X_new = new_df.copy()
-    if 'ID' in X_new.columns: X_new = X_new.drop(columns=['ID'])
     y_true = None
-    st.warning("No target column found or specified. Performance metrics will be skipped.")
+    st.warning(f"Target column '{target_col}' not found. Performance metrics will be skipped.")
 
-# DYNAMIC BASELINE: Use the buffer as reference
-# Combine recent batches into a single reference distribution
+# DYNAMIC BASELINE: Combine recent batches
 current_reference = pd.concat(st.session_state.rolling_buffer[-window_size:])
 
 # -----------------------------------
@@ -156,7 +177,6 @@ current_reference = pd.concat(st.session_state.rolling_buffer[-window_size:])
 drift_results = []
 feature_importance = {}
 
-# Try to get feature importance from model
 if hasattr(model, 'feature_importances_'):
     feature_importance = dict(zip(X_new.columns, model.feature_importances_))
 elif hasattr(model, 'coef_'):
@@ -176,79 +196,77 @@ for col in X_new.select_dtypes(include=[np.number]).columns:
             'Impact Rank': u_score * importance
         })
 
-drift_summary_df = pd.DataFrame(drift_results).sort_values(by='Impact Rank', ascending=False)
-avg_unified_drift = drift_summary_df['Unified Drift'].mean()
+if drift_results:
+    drift_summary_df = pd.DataFrame(drift_results).sort_values(by='Impact Rank', ascending=False)
+    avg_unified_drift = drift_summary_df['Unified Drift'].mean()
+else:
+    drift_summary_df = pd.DataFrame(columns=['Feature', 'Unified Drift', 'Impact Rank'])
+    avg_unified_drift = 0.0
 
 # -----------------------------------
-# PERFORMANCE & DECAY
+# PREDICTION & PERFORMANCE
 # -----------------------------------
-# Attempt Prediction
-# Note: This assumes model has a predict method and data matches features
 try:
-    # Minimal preprocessing if model expects array
-    # In a real system, we'd apply the loaded Scaler/Imputer here.
-    # For this snippet, we'll try direct prediction if scaler isn't provided or needed
-    y_pred = model.predict(X_new)
+    # Full Preprocessing Pipeline
+    X_proc = X_new.copy()
+    if imputer:
+        X_proc = imputer.transform(X_proc)
+    if scaler:
+        X_proc = scaler.transform(X_proc)
+    
+    y_pred = model.predict(X_proc)
     
     current_perf = None
     perf_drop = 0.0
     if y_true is not None:
         current_perf = f1_score(y_true, y_pred, zero_division=0)
         perf_drop = max(0, base_perf - current_perf)
-        st.session_state.perf_history.append(current_perf)
+        # Avoid duplicate appending if session state persists across reruns unexpectedly
+        if not st.session_state.perf_history or st.session_state.perf_history[-1] != current_perf:
+             st.session_state.perf_history.append(current_perf)
 except Exception as e:
-    st.error(f"Prediction Error: {e}. Ensure the model and data columns match.")
+    st.error(f"Prediction Error: {e}")
     perf_drop = 0.0
     current_perf = 0.0
 
-# Drift Impact Score calculation
 drift_impact_score = (alpha * avg_unified_drift) + ((1 - alpha) * perf_drop)
 
-# Moving Average & Trend
+# Trend Analysis
 trend_val = 0
-decay_detected = False
-if len(st.session_state.perf_history) >= 3:
-    history = st.session_state.perf_history
-    # Trend using polyfit
+if len(st.session_state.perf_history) >= 2:
+    history = st.session_state.perf_history[-10:]
     trend_val = np.polyfit(range(len(history)), history, 1)[0]
-    if trend_val < -0.01: # Threshold for "Consistent Decline"
-        decay_detected = True
 
 # -----------------------------------
 # DASHBOARD UI
 # -----------------------------------
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Unified Drift Score", f"{avg_unified_drift:.4f}")
 m2.metric("Drift Impact Score", f"{drift_impact_score:.4f}")
-m3.metric("Current F1-Score", f"{current_perf:.4f}" if current_perf else "N/A")
-m4.metric("Model Health Trend", "Decline" if trend_val < 0 else "Stable", delta=f"{trend_val:.4f}")
+m3.metric("Baseline F1-Score", f"{base_perf:.4f}")
+m4.metric("Current F1-Score", f"{current_perf:.4f}" if current_perf else "N/A", delta=f"{current_perf - base_perf:.4f}" if current_perf else None)
+m5.metric("Model Health Trend", "Decline" if trend_val < 0 else "Stable", delta=f"{trend_val:.4f}")
 
 st.divider()
 
 if drift_impact_score > threshold:
-    st.error(f"🚨 **CRITICAL ALERT**: Drift Impact Score ({drift_impact_score:.4f}) exceeds threshold ({threshold}). Retraining recommended.")
-elif decay_detected:
-    st.warning("⚠️ **DECAY WARNING**: Consistent performance degradation detected over multiple runs.")
+    st.error(f"🚨 **CRITICAL ALERT**: Drift Impact Score ({drift_impact_score:.4f}) exceeds threshold. Retraining recommended.")
+elif trend_val < -0.01:
+    st.warning("⚠️ **DECAY WARNING**: Consistent performance degradation detected.")
 else:
-    st.success("🟢 System Status: Stable. No significant impact detected.")
+    st.success("🟢 System Status: Stable.")
 
-# Layout: Feature Analysis & Trends
+# Visuals
 col_left, col_right = st.columns([3, 2])
-
 with col_left:
     st.subheader("🔍 Feature-Level Drift Analysis")
     st.dataframe(drift_summary_df.head(10).style.background_gradient(subset=['Unified Drift'], cmap='OrRd'), use_container_width=True)
     
-    st.subheader("📈 Performance History (Moving Trend)")
-    if len(st.session_state.perf_history) > 0:
+    st.subheader("📈 Performance History")
+    if st.session_state.perf_history:
         fig, ax = plt.subplots(figsize=(10, 4))
         plt.style.use('dark_background')
-        ax.plot(st.session_state.perf_history, marker='o', color='#38bdf8', label='Batch Performance')
-        # Moving average
-        if len(st.session_state.perf_history) >= 3:
-            ma = pd.Series(st.session_state.perf_history).rolling(window=3).mean()
-            ax.plot(ma, linestyle='--', color='#f59e0b', label='Trend (SMA 3)')
-        
+        ax.plot(st.session_state.perf_history, marker='o', color='#38bdf8', label='Batch F1-Score')
         ax.set_facecolor('#0f172a')
         fig.patch.set_facecolor('#0f172a')
         ax.legend()
@@ -256,24 +274,16 @@ with col_left:
 
 with col_right:
     st.subheader("📊 Drift Metric Breakdown")
-    # Small bar chart of avg values
-    metrics_avg = {
-        'PSI': drift_summary_df['PSI'].mean(),
-        'KL': drift_summary_df['KL'].mean(),
-        'JS': drift_summary_df['JS'].mean()
-    }
-    st.bar_chart(metrics_avg)
-    
-    st.info("""
-    **Insight Engine:**
-    - **PSI**: Measures volume stability.
-    - **KL/JS**: Measures statistical 'distance' between distributions.
-    - **Impact Rank**: Prioritizes features that have high drift AND high influence on the model.
-    """)
+    if not drift_summary_df.empty:
+        metrics_avg = {
+            'PSI': drift_summary_df['PSI'].mean(),
+            'KL': drift_summary_df['KL'].mean(),
+            'JS': drift_summary_df['JS'].mean()
+        }
+        st.bar_chart(metrics_avg)
 
-# Button to commit current data to the Rolling Baseline
 if st.button("✅ Commit to Rolling Baseline"):
     st.session_state.rolling_buffer.append(X_new)
     if len(st.session_state.rolling_buffer) > window_size:
         st.session_state.rolling_buffer.pop(0)
-    st.toast("Current batch added to reference buffer!")
+    st.toast("Batch committed!")

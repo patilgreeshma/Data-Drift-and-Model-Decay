@@ -1,3 +1,18 @@
+# Environments
 .venv/
+
+
+# Model Artifacts
 *.pkl
-*.csv
+
+# Data Files (Exclude generated batches and temporary data)
+batchA.csv
+batchB.csv
+batchC.csv
+new_data.csv
+drifted_adult_data.csv
+performance_history.pkl
+
+# System files
+.DS_Store
+__pycache__/

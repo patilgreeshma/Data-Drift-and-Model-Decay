@@ -12,7 +12,7 @@ future_df = df.copy()
 np.random.seed(42)
 
 # Apply realistic drift
-future_df['LIMIT_BAL'] = future_df['LIMIT_BAL'] * 1.5
+future_df['LIMIT_BAL'] = future_df['LIMIT_BAL'] * 4
 future_df['BILL_AMT1'] = future_df['BILL_AMT1'] * 1.3
 future_df['PAY_AMT1'] = future_df['PAY_AMT1'] * 0.7
 future_df['AGE'] = future_df['AGE'] + 2
@@ -25,6 +25,6 @@ if target_col in num_cols:
 future_df[num_cols] = future_df[num_cols] + np.random.normal(0, 0.05, future_df[num_cols].shape)
 
 # Save
-future_df.to_csv("new_data.csv", index=False)
+future_df.to_csv("batchC.csv", index=False)
 
-print("✅ new_data.csv created with clean targets")
+print("✅ batchC.csv created with clean targets")
